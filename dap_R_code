@@ -1,0 +1,264 @@
+sessionInfo()
+break
+rm(list=ls())
+#load data
+#lymp <- read.table(header = T,'~/Lymphom.txt')
+lymp <- read.table(header = T,'~/Downloads/Lymphom.txt')
+#remove no radiation patients
+l1 <- lymp[lymp$Rad==1,]
+head(l1)
+l1$Reg <- as.factor(l1$Reg)
+l1$Dth <- as.factor(l1$Dth)
+l1$Site <- as.factor(l1$Site)
+l1$RacB <- as.factor(l1$RacB)
+l1$Stag <- as.factor(l1$Stag)
+head(l1)
+#set outcome to lymphoma related death
+l1$Caus2 <- ifelse(l1$Caus==1,1,0)
+
+
+################# fit PS ##########
+#tune gbm with caret
+library(caret)
+fitControl <- trainControl(## 10-fold CV
+  #method = "repeatedcv",
+  method = 'cv',
+  number = 10,
+  #repeats= 5,
+  allowParallel = T,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+gbmGrid <-  expand.grid(interaction.depth = c(15,20,30), 
+                        n.trees = (1:10)*100, 
+                        shrinkage = c(.01),
+                        n.minobsinnode = c(10,20))
+#set covariates
+tx <- l1$RdSrg
+#names(l1)
+names <- names(l1[,c(1:5,9:11)])
+x <- l1[,names]
+#set parllel
+library(doParallel)
+registerDoParallel(detectCores())
+#caret train
+gbm1 <- gbmFit2 <- train(y=factor(tx,levels=c(0,1),labels=c('noSurg','Surg')),x=x, 
+                         method = "gbm", 
+                         trControl = fitControl, 
+                         metric = 'ROC',
+                         verbose = T, 
+                         tuneGrid = gbmGrid)
+#view graph of tuning parameters
+plot(gbm1)
+plot(gbm2)
+#best tune parameters
+gbm1$bestTune
+gbm2$bestTune
+
+save(gbm1,file='gbm1.RData')
+load('~/Code/gbm1.RData')
+
+#set parallel functions for SuperLearner
+library(parallel)
+options('mc.cores'=detectCores())
+options()$mc.cores
+library(doParallel)
+registerDoParallel(detectCores())
+#load packages
+library(SuperLearner)
+
+#glmnet wrapper generating function
+create.SL.glmnet <- function(alpha = c(0.25, 0.50, 0.75)) {
+  for(mm in seq(length(alpha))){
+    eval(parse(text = paste('SL.glmnet.', alpha[mm], '<- function(..., alpha = ', alpha[mm], ') SL.glmnet(..., alpha = alpha)', sep = '')), envir = .GlobalEnv)
+  }
+  invisible(TRUE)
+}
+
+#change to run on only one set - #change cv.folds to 1, replace best.iter with 1000
+SL.gbmfull <- function(Y, X, newX, family, obsWeights, gbm.trees = 500, 
+                       interaction.depth = 30, shrinkage = .01, n.minobsinnode = 20, ...) 
+{
+  require("gbm")
+  gbm.model <- as.formula(paste("Y~", paste(colnames(X), collapse = "+")))
+  if (family$family == "gaussian") {
+    fit.gbm <- gbm::gbm(formula = gbm.model, data = X, distribution = "gaussian", 
+                        n.trees = gbm.trees, interaction.depth = interaction.depth,  
+                        shrinkage = shrinkage, n.minobsinnode = n.minobsinnode,
+                        cv.folds = 0, keep.data = TRUE, weights = obsWeights, 
+                        verbose = FALSE)
+  }
+  if (family$family == "binomial") {
+    fit.gbm <- gbm::gbm(formula = gbm.model, data = X, distribution = "bernoulli", 
+                        n.trees = gbm.trees, interaction.depth = interaction.depth,  
+                        shrinkage = shrinkage, n.minobsinnode = n.minobsinnode,
+                        cv.folds = 0, keep.data = TRUE, verbose = FALSE, 
+                        weights = obsWeights)
+  }
+  pred <- predict(fit.gbm, newdata = newX, 500, type = "response")
+  fit <- list(object = fit.gbm, n.trees = 500)
+  out <- list(pred = pred, fit = fit)
+  class(out$fit) <- c("SL.gbm")
+  return(out)
+}
+# create glmnet functions
+create.SL.glmnet(alpha = c(0,0.50))
+
+#create library for SuperLearner
+SL.library <- c(#'SL.glmnet',         #default alpha 1 (lasso)
+  'SL.glmnet.0',       #ridge regression
+  #'SL.glmnet.0.5',     #halfway between ridge and lasso 
+  'SL.gbmfull'#,        #optimal gbm for dataset based on tunegrid above
+  #'SL.randomForest'
+)
+#fit Superlearner
+fitSL2 <- SuperLearner (Y = tx ,
+                        X = x,
+                        SL.library = SL.library,
+                        family = binomial(),    #binomial family from binary outcome
+                        method = "method.AUC",  #AUC used to measure model performance
+                        verbose = T,            #suppresses reporting details
+                        cvControl = list(V=16, stratifyCV = TRUE)  #CV is stratefied to avoid splits with only a single outcome
+) 
+fitSL <- fitSL2
+save(fitSL,file='fitSL.Rdata')
+load(file='~/Code/fitSL.Rdata')
+
+varImp(fitSL$fitLibrary$SL.gbmfull_All$object,fitSL$fitLibrary$SL.gbmfull_All$n.trees)
+par(mfrow=c(2,2))
+plot(fitSL$fitLibrary$SL.gbmfull_All$object, i.var = 2, lwd = 2, col = "blue", main = "")
+plot(fitSL$fitLibrary$SL.gbmfull_All$object, i.var = 3, lwd = 2, col = "blue", main = "")
+plot(fitSL$fitLibrary$SL.gbmfull_All$object, i.var = 8, lwd = 2, col = "blue", main = "")
+plot(fitSL$fitLibrary$SL.gbmfull_All$object, i.var = 1, lwd = 2, col = "blue", main = "")
+dev.off()
+
+#generate predictions for treatment
+library('ggplot2')
+library(pROC)
+pred <- predict.SuperLearner(fitSL,x,binomial(),X=x,Y=tx,onlySL=F)
+roc(tx,as.vector(pred$pred))$auc[1]
+roc <- roc(tx,as.vector(pred$pred))
+#roc curve of predictions
+plot(roc,print.auc=TRUE)
+#histogram of predictions
+ggplot(data.frame(pred=pred$pred),aes(x=pred))+geom_histogram()
+#save weights
+w <- tx/pred$pred + (1-tx)/(1-pred$pred)
+#check balance
+ggplot(data.frame(w=w,tx=tx),aes(x=w,group=tx,color=tx))+geom_histogram()
+ggplot(data.frame(prob=pred$pred,tx=factor(tx)),aes(x=prob,group=tx,color=tx))+geom_histogram()
+
+
+#Cross-validate prediction models
+fitcvSL <- CV.SuperLearner ( Y = tx ,
+                             X = x ,
+                             family = binomial(),
+                             SL.library = SL.library,
+                             method = "method.AUC",
+                             verbose = T,
+                             control = list(saveFitLibrary = FALSE),
+                             cvControl = list(V=10, stratifyCV = TRUE),
+                             innerCvControl = list(V=16),
+                             saveAll = T,
+                             parallel = 'multicore'
+)
+save(fitcvSL,file='fitcvSL.Rdata')
+load(file='~/Code/fitcvSL.Rdata')
+fit.summary <- summary(fitcvSL)
+
+
+
+#fit survival with IPW weights
+cphIPW1 <- coxph(Surv(time=Tim,event=Caus2)~RdSrg,data=l1,weights=w)
+summary(cphIPW1)
+cphIPW1$coefficients[1]
+cphIPW1 <- coxph(Surv(time=Tim,event=Caus2)~RdSrg,data=l1,weights=w)
+cphIPW2 <- coxph(Surv(time=Tim,event=Caus2)~RdSrg+Reg+BYr+Age+Grad+Site+Stag,data=l1,weights=w)
+summary(cphIPW2)
+anova(cphIPW1,cphIPW2)
+
+coxph(Surv(time=Tim,event=Caus2)~RdSrg+Reg,data=l1,weights=w)
+coxph(Surv(time=Tim,event=Caus2)~RdSrg+BYr,data=l1,weights=w)
+coxph(Surv(time=Tim,event=Caus2)~RdSrg+Age,data=l1,weights=w)
+coxph(Surv(time=Tim,event=Caus2)~RdSrg+Sex,data=l1,weights=w)
+coxph(Surv(time=Tim,event=Caus2)~RdSrg+Grad,data=l1,weights=w)
+coxph(Surv(time=Tim,event=Caus2)~RdSrg+Site,data=l1,weights=w)
+coxph(Surv(time=Tim,event=Caus2)~RdSrg+RacB,data=l1,weights=w)
+coxph(Surv(time=Tim,event=Caus2)~RdSrg+Stag,data=l1,weights=w)
+
+#bootstrap 
+#sample vectors
+set.seed(956)
+samp <- as.matrix(replicate(1000,sample(1:nrow(l1),nrow(l1),replace=T)))
+#bootstrap function
+bootcphipw <- function(dat=l1,i) {
+  y <- dat$RdSrg[i]
+  x <- dat[i,c(1:5,9:11)]
+  fitSL <- SuperLearner (Y = y,
+                         X = x,
+                         SL.library = SL.library,
+                         family = binomial(),    #binomial family from binary outcome
+                         method = "method.AUC",  #AUC used to measure model performance
+                         verbose = F,            #suppresses reporting details
+                         cvControl = list(V=10, stratifyCV = TRUE)  #CV is stratefied to avoid splits with only a single outcome
+  )
+  pred <- predict.SuperLearner(fitSL,x,binomial(),X=x,Y=y,onlySL=F)
+  w <- y/pred$pred+(1-y)/(1-pred$pred)
+  cphIPW <- coxph(Surv(time=Tim,event=Caus2)~RdSrg+Reg+BYr+Age+Grad+Site+Stag,data=l1,weights=w)
+  cphIPW$coefficients[1]
+}
+#run bootstrap in parallel
+ptm <- proc.time()
+bootresults2 <- unlist(mclapply(1:1000,function(i) bootcphipw(l1,samp[,i])))
+proc.time() - ptm
+save(bootresults,file='bootresults.RData')
+load(file='~/Code/bootresults2.RData')
+exp(mean(bootresults2))
+mean(bootresults2)
+sd(bootresults2)
+exp(quantile(bootresults2,probs=c(.025,.975)))
+
+
+#sensitivity analysis
+linsens = function(lhr,se.lhr,gamma1,gamma0,P1,P0,alpha=0.05) {
+  lhr.adj = lhr - log( (exp(gamma1)*P1+(1-P1))/(exp(gamma0)*P0+(1-P0)) )
+  crit = qnorm(1-alpha/2)
+  return(c(lhr.adj=lhr.adj,lhr.adj.lower.ci=lhr.adj-crit*se.lhr,lhr.adj.upper.ci=lhr.adj+crit*se.lhr))
+}
+
+sensGrid <-  expand.grid(gamma0 = c(log(1),log(1.25),log(1.5),log(2),log(4)), 
+                         gamma1 = c(log(1),log(1.25),log(1.5),log(2),log(4)), 
+                         P0 = seq(0.01,0.4,by=0.05),
+                         P1 = seq(0.01,0.4,by=0.05))
+
+sense <- matrix(nrow=nrow(sensGrid),ncol=3)
+for(i in 1:nrow(sensGrid)) {sense[i,]<- do.call(linsens, as.list(c(mean(bootresults2),sd(bootresults2),sensGrid[i,])))}
+colnames(sense) <- c('lhr.adj','lhr.adj.lower.ci','lhr.adj.upper.ci')
+test <- cbind(sensGrid,sense)
+#plot sensitivity analysis
+ggplot(data.frame(test[1:5]),aes(y=P0,x=P1,color=lhr.adj)) + geom_point(size=3)+facet_grid(round(gamma0,3)~round(gamma1,3))+scale_color_gradient2(midpoint=0,low="black", mid="white", high="red")
+ggplot(data.frame(test[1:7]),aes(y=P0,x=P1,color=lhr.adj.upper.ci)) + geom_point(size=3)+facet_grid(round(gamma0,3)~round(gamma1,3))+scale_color_gradient2(midpoint=0,low="black", mid="white", high="red")
+names(test)
+
+#do matching
+install.packages('MatchIt')
+library(MatchIt)
+
+y <- l1$RdSrg
+x <- l1[,c(1:5,8:11)]
+match1 <- matchit(RdSrg~Reg+BYr+Age+Sex+Grad+Site+RacB+Stag,data=l1)
+
+summary(match1)
+plot(match1)
+
+km1 <- survfit(Surv(time=Tim,event=Caus2)~RdSrg+Reg+BYr+Age+Grad+Site+Stag,data=l1,subset=(match1$weights == 1))
+plot(km1,col=c(1,2))
+sd1 <- survdiff(Surv(time=Tim,event=Caus2)~RdSrg,data=l1,subset=(match1$weights == 1))
+cph1 <- coxph(Surv(time=Tim,event=Caus2)~RdSrg+Reg+BYr+Age+Grad+Site+Stag,data=l1,subset=(match1$weights == 1))
+
+match2 <- matchit(RdSrg~Reg+BYr+Age+Sex+Grad+Site+RacB+Stag,data=l1,method="subclass")
+summary(match2)
+plot(match2)
+cph1b <- coxph(Surv(time=Tim,event=Caus2)~RdSrg+Reg+BYr+Age+Grad+Site+Stag+strata(match2$subclass),data=l1)
+
+
